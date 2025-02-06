@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -6,11 +12,20 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
+use git2::{
+    Cred, FetchOptions, RemoteCallbacks,
+    build::RepoBuilder,
+};
 use ratelimit::Ratelimiter;
-use tokio::{net::TcpListener, sync::mpsc::UnboundedSender};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc::UnboundedSender,
+};
+use tracing::Level;
 
 
 /// Externally-provided configuration.
+#[derive(Debug)]
 struct GlobalConfig {
     /// The IP or hostname to listen for TCP connections.
     pub tcp_host: String,
@@ -18,15 +33,27 @@ struct GlobalConfig {
     pub tcp_port: u16,
     /// Max. number of requests per minute allowed by internal ratelimiter.
     pub req_per_minute: u64,
+    /// Source Git repository URL using SSH.
+    pub ssh_repo_url: String,
+    /// Path to a *public* deploy key for Git SSH connection.
+    pub ssh_key_path_pub: String,
+    /// Path to a *private* deploy key for Git SSH connection.
+    pub ssh_key_path: String,
+    /// Target Git directory into which the repository should be cloned.
+    pub out_repo_path: PathBuf,
 }
 
 impl GlobalConfig {
     /// Initializes a config with default values.
     pub fn new() -> Self {
         Self {
-            tcp_host: "0.0.0.0".to_string(),
+            tcp_host: "0.0.0.0".into(),
             tcp_port: 4331,
-            req_per_minute: 2,
+            req_per_minute: 30,
+            ssh_repo_url: "git@github.com:alexobolev/gha-ping.git".into(),
+            ssh_key_path_pub: "./local/gha_ping_ed25519.pub".into(),
+            ssh_key_path: "./local/gha_ping_ed25519".into(),
+            out_repo_path: "./local/tmp".into(),
         }
     }
 }
@@ -40,8 +67,8 @@ impl Default for GlobalConfig {
 
 /// Internally-shared state for route handlers.
 struct GlobalState {
-    sender: UnboundedSender<()>,
-    ratelimiter: Ratelimiter,
+    pub sender: UnboundedSender<()>,
+    pub ratelimiter: Ratelimiter,
 }
 
 impl GlobalState {
@@ -70,7 +97,11 @@ impl GlobalState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
+        .with_max_level(Level::TRACE)
+        .init();
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
 
@@ -81,19 +112,19 @@ async fn main() {
         .route("/update", post(handle_update))
         .with_state(state);
 
+    // This will check SSH key but not repository path.
+    if !check_github_creds(config.clone()) {
+        tracing::error!("can't verify github credentials");
+        return;
+    }
+
     let config1 = config.clone();
     tokio::task::spawn_blocking(move || {
         tracing::info!("starting background thread");
         let mut receiver = receiver;
 
-        loop {
-            match receiver.blocking_recv() {
-                Some(()) => {
-                    tracing::info!("worker notified");
-                    process_update(config1.clone());
-                },
-                None => break,
-            }
+        while let Some(()) = receiver.blocking_recv() {
+            process_update(config1.clone());
         }
 
         tracing::info!("terminating background thread");
@@ -135,7 +166,58 @@ async fn handle_update(
 }
 
 
-/// Background repository pull logic.
-fn process_update(config: Arc<GlobalConfig>) {
+/// Checks that given ssh credentials are valid for GitHub.
+fn check_github_creds(config: Arc<GlobalConfig>) -> bool {
+    let output = Command::new("ssh")
+        .args([
+            "-o", "IdentitiesOnly=yes",
+            "-F", "none",
+            "-i", &config.ssh_key_path,
+            "-T", "git@github.com",
+        ])
+        .output();
 
+    match output {
+        Ok(output) => {
+            output.status.code().is_some_and(|c| c == 1)
+        },
+        Err(error) => {
+            tracing::error!("failed to execute ssh: {}", error);
+            false
+        }
+    }
+}
+
+
+/// Clones the repository on request.
+fn process_update(config: Arc<GlobalConfig>) {
+    // Can't have global RepoBuilder and friends here because it has lifetimes...
+
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(|url, username, allowed_types| {
+        tracing::info!("logging in to: {}, allowed: {:?}", url, allowed_types);
+
+        let username = username.unwrap_or("git");
+        let publickey = Some(Path::new(&config.ssh_key_path_pub));
+        let privatekey = Path::new(&config.ssh_key_path);
+
+        let creds = Cred::ssh_key(username, publickey, privatekey, None);
+        debug_assert!(creds.is_ok(), "failed to create SSH key credential");
+
+        creds
+    });
+
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+
+    let mut repo_builder = RepoBuilder::new();
+    repo_builder.fetch_options(fetch_options);
+
+    tracing::debug!("cloning repository: {}", &config.ssh_repo_url);
+    match repo_builder.clone(&config.ssh_repo_url, &config.out_repo_path) {
+        Ok(_) => tracing::info!("cloned the repository"),
+        Err(error) =>
+            tracing::error!("failed to clone: {} code = {:?}, class = {:?}",
+                error.message(), error.code(), error.class()),
+    }
 }
