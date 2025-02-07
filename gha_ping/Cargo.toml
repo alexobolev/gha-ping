@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 axum = { workspace = true }
-git2 = { workspace = true }
 ratelimit = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
