@@ -1,4 +1,5 @@
 use std::{
+    env,
     net::SocketAddr,
     process::Command,
     sync::Arc,
@@ -34,19 +35,59 @@ struct GlobalConfig {
     pub ssh_key_path: String,
     /// Target Git directory into which the repository should be cloned.
     pub out_repo_path: String,
+    /// Use verbose logging.
+    pub verbose: bool,
 }
 
 impl GlobalConfig {
-    /// Initializes a config with default values.
+    /// Initializes a config using environment and default values.
     pub fn new() -> Self {
-        Self {
-            tcp_host: "0.0.0.0".into(),
-            tcp_port: 4331,
-            req_per_minute: 30,
-            ssh_repo_url: "git@github.com:alexobolev/gha-ping.git".into(),
-            ssh_key_path: "./local/gha_ping_ed25519".into(),
-            out_repo_path: "./local/tmp".into(),
+        fn load_string(key: &'static str, default: &str) -> String {
+            env::var(key).unwrap_or_else(|_| default.into())
         }
+
+        fn load_u64(key: &'static str, default: u64) -> u64 {
+            if let Ok(string) = env::var(key) {
+                let msg = format!("invalid {} value: {}", key, &string);
+                string.parse::<u64>().expect(&msg)
+            } else {
+                default
+            }
+        }
+
+        fn load_bool(key: &'static str, default: bool) -> bool {
+            if let Ok(string) = env::var(key) {
+                let lowercase = string.to_lowercase();
+                match lowercase.as_str() {
+                    "t" | "true" | "on" | "yes" => true,
+                    "f" | "false" | "off" | "no" => false,
+                    other => panic!("invalid {} value: {}", key, other),
+                }
+            } else {
+                default
+            }
+        }
+
+        Self {
+            tcp_host: load_string("GHAP_TCP_HOST", "0.0.0.0"),
+            tcp_port: load_u64("GHAP_TCP_PORT", 4331) as u16,
+            req_per_minute: load_u64("GHAP_MAX_RPM", 30),
+            ssh_repo_url: load_string("GHAP_SSH_REPO_URL", "git@github.com:alexobolev/gha-ping.git"),
+            ssh_key_path: load_string("GHAP_SSH_KEY_PATH", "./local/gha_ping_ed25519"),
+            out_repo_path: load_string("GHAP_OUT_REPO_PATH", "./local/tmp"),
+            verbose: load_bool("GHAP_VERBOSE", true),
+        }
+    }
+
+    /// Logs contents of this configuration with `Level::INFO` severity.
+    pub fn log_with_prefix(&self, prefix: &str) {
+        tracing::info!("{}'tcp_host' = {}", prefix, self.tcp_host);
+        tracing::info!("{}'tcp_port' = {}", prefix, self.tcp_port);
+        tracing::info!("{}'req_per_minute' = {}", prefix, self.req_per_minute);
+        tracing::info!("{}'ssh_repo_url' = {}", prefix, self.ssh_repo_url);
+        tracing::info!("{}'ssh_key_path' = {}", prefix, self.ssh_key_path);
+        tracing::info!("{}'out_repo_path' = {}", prefix, self.out_repo_path);
+        tracing::info!("{}'verbose' = {}", prefix, self.verbose);
     }
 }
 
@@ -91,14 +132,16 @@ impl GlobalState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
-        .init();
-
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let config = Arc::new(GlobalConfig::new());
     let state = Arc::new(GlobalState::new(config.as_ref(), sender));
+
+    let max_level = if config.verbose { Level::TRACE } else { Level::INFO };
+    tracing_subscriber::fmt().with_max_level(max_level).init();
+
+    tracing::info!("initializing with config:");
+    config.log_with_prefix("   ");
 
     tracing::debug!("veryfying github credentials");
     if !check_github_creds(config.clone(), state.clone()) {
@@ -181,6 +224,8 @@ fn process_update(config: Arc<GlobalConfig>, state: Arc<GlobalState>) {
     tracing::info!("running `git clone` on request: {} -> {}",
         &config.ssh_repo_url, &config.out_repo_path);
 
+    // TODO: Do something with existing directory...
+
     let result = Command::new("git")
         .env("GIT_SSH_COMMAND", &state.ssh)
         .args(["clone", &config.ssh_repo_url, &config.out_repo_path])
@@ -189,7 +234,7 @@ fn process_update(config: Arc<GlobalConfig>, state: Arc<GlobalState>) {
     match result {
         Ok(output) => {
             if output.status.success() {
-                tracing::debug!("git clone code:   {}", output.status.code().unwrap_or(-1));
+                tracing::info!("git clone code:   {}", output.status.code().unwrap_or(-1));
                 if let Some(stdout) = try_load_string(output.stdout) {
                     for line in stdout.lines() {
                         tracing::debug!("git clone stdout:   {}", line);
