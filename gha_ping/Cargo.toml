@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { workspace = true }
+chrono = { workspace = true }
 ratelimit = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

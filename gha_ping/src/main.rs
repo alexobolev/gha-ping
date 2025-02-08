@@ -12,6 +12,7 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
+use chrono::Utc;
 use ratelimit::Ratelimiter;
 use tokio::{
     net::TcpListener,
@@ -140,10 +141,12 @@ async fn main() {
     let max_level = if config.verbose { Level::TRACE } else { Level::INFO };
     tracing_subscriber::fmt().with_max_level(max_level).init();
 
+    tracing::debug!("current working directory: {}", std::env::current_dir().unwrap().to_string_lossy());
+
     tracing::info!("initializing with config:");
     config.log_with_prefix("   ");
 
-    tracing::debug!("veryfying github credentials");
+    tracing::info!("veryfying github credentials");
     if !check_github_creds(config.clone(), state.clone()) {
         tracing::error!("can't verify github credentials");
         return;
@@ -210,9 +213,11 @@ fn check_github_creds(config: Arc<GlobalConfig>, state: Arc<GlobalState>) -> boo
         .output();
 
     match result {
-        Ok(output) => output.status.success(),
+        Ok(output) => {
+            process_output(output, "git ls-remote")
+        },
         Err(error) => {
-            tracing::error!("failed to execute git: {}", error);
+            tracing::error!("failed to execute git ls-remote: {}", error);
             false
         }
     }
@@ -221,37 +226,39 @@ fn check_github_creds(config: Arc<GlobalConfig>, state: Arc<GlobalState>) -> boo
 
 /// Clones the repository on request.
 fn process_update(config: Arc<GlobalConfig>, state: Arc<GlobalState>) {
-    tracing::info!("running `git clone` on request: {} -> {}",
-        &config.ssh_repo_url, &config.out_repo_path);
-
-    // TODO: Do something with existing directory...
+    // TODO: Find a better way of handling existing repository.
+    let output_path = format!("{}/{}", config.out_repo_path, Utc::now().format("%Y%m%d-%H%M%S"));
+    tracing::info!("running `git clone` on request: {} -> {}", &config.ssh_repo_url, &output_path);
 
     let result = Command::new("git")
         .env("GIT_SSH_COMMAND", &state.ssh)
-        .args(["clone", &config.ssh_repo_url, &config.out_repo_path])
+        .args(["clone", &config.ssh_repo_url, &output_path])
         .output();
 
     match result {
-        Ok(output) => {
-            if output.status.success() {
-                tracing::info!("git clone code:   {}", output.status.code().unwrap_or(-1));
-                if let Some(stdout) = try_load_string(output.stdout) {
-                    for line in stdout.lines() {
-                        tracing::debug!("git clone stdout:   {}", line);
-                    }
-                }
-            } else {
-                tracing::error!("git clone code:   {}", output.status.code().unwrap_or(-1));
-                if let Some(stderr) = try_load_string(output.stderr) {
-                    for line in stderr.lines() {
-                        tracing::error!("git clone stderr:   {}", line);
-                    }
-                }
+        Ok(output) => { process_output(output, "git clone"); },
+        Err(error) =>  tracing::error!("failed to execute git clone: {}", error),
+    }
+}
+
+
+fn process_output(output: std::process::Output, prefix: &str) -> bool {
+    if output.status.success() {
+        tracing::info!("{} code:   {}", prefix, output.status.code().unwrap_or(-1));
+        if let Some(stdout) = try_load_string(output.stdout) {
+            for line in stdout.lines() {
+                tracing::debug!("{} stdout:   {}", prefix, line);
             }
-        },
-        Err(error) => {
-            tracing::error!("failed to execute git: {}", error);
         }
+        true
+    } else {
+        tracing::error!("{} code:   {}", prefix, output.status.code().unwrap_or(-1));
+        if let Some(stderr) = try_load_string(output.stderr) {
+            for line in stderr.lines() {
+                tracing::error!("{} stderr:   {}", prefix, line);
+            }
+        }
+        false
     }
 }
 
