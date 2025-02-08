@@ -15,7 +15,17 @@ jobs:
         env:
           SERVER_NOTIFY_URL: ${{ secrets.SERVER_NOTIFY_URL }}
         run: |
-          echo 'SERVER_RESPONSE_CODE=$(echo $SERVER_NOTIFY_URL | xargs curl -s -o /dev/null -w "%{http_code}" -X POST)' >> $GITHUB_ENV
+          curlout=$(echo $SERVER_NOTIFY_URL | xargs curl -s -o /dev/null -w "%{http_code}" -X POST)
+          if [ $? -eq 0 ]; then
+            echo "SERVER_RESPONSE_CODE=$curlout" >> "$GITHUB_ENV"
+          else
+            echo "::error::Curl failed with code: $?"
+            exit 1
+          fi
+      - name: Log response code
+        shell: bash
+        run: |
+          echo "Server responded with code: ${{ env.SERVER_RESPONSE_CODE }}""
       - name: Fail on wrong HTTP response code
         if: ${{ env.SERVER_RESPONSE_CODE != '204' }}
         shell: bash
