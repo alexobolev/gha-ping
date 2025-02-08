@@ -1,0 +1,26 @@
+name: Notify server
+on:
+  push:
+    branches:
+      main
+  workflow_dispatch:
+
+jobs:
+  notify:
+    name: Post /update to server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send POST request
+        shell: bash
+        env:
+          SERVER_NOTIFY_URL: ${{ secrets.SERVER_NOTIFY_URL }}
+        run: |
+          out_code = $(echo $SERVER_NOTIFY_URL | xargs xargs curl -s -o /dev/null -w "%{http_code}" -X POST)
+          echo "Server responded with code: $out_code"
+          echo "SERVER_RESPONSE_CODE=$out_code" >> $GITHUB_ENV
+      - name: Fail on wrong HTTP response code
+        if: ${{ env.SERVER_RESPONSE_CODE != '204' }}
+        shell: bash
+        run: |
+          echo "::error::Server responded with unexpected code: ${{ env.SERVER_RESPONSE_CODE }}"
+          exit 1
