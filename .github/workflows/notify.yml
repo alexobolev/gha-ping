@@ -25,7 +25,7 @@ jobs:
       - name: Log response code
         shell: bash
         run: |
-          echo "Server responded with code: ${{ env.SERVER_RESPONSE_CODE }}""
+          echo "Server responded with code: ${{ env.SERVER_RESPONSE_CODE }}"
       - name: Fail on wrong HTTP response code
         if: ${{ env.SERVER_RESPONSE_CODE != '204' }}
         shell: bash
